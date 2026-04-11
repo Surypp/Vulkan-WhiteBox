@@ -1,0 +1,23 @@
+# dependencies (use submodule or vcpkg)
+glm/
+
+# compiled shader binaries
+res/shaders/*.spv
+
+# third-party tooling
+res/shaders/glslc.exe
+
+# MSVC build artifacts
+*.obj
+*.pdb
+*.ilk
+*.exe
+*.dll
+build/
+x64/
+Debug/
+Release/
+.vs/
+*.user
+*.vcxproj.filters
+
