@@ -1,0 +1,182 @@
+#pragma once
+
+#define GLFW_INCLUDE_VULKAN
+#include <GLFW/glfw3.h>
+#include <vector>
+#include <array>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <functional>
+#include <chrono>
+#include <atomic>
+#include <exception>
+
+#define GLM_FORCE_RADIANS
+#define GLM_FORCE_DEPTH_ZERO_TO_ONE
+#include <glm/glm.hpp>
+
+#include "../core/Vertex.h"
+#include "../core/UniformBufferObject.h"
+#include "../core/SwapChainSupportDetails.h"
+#include "../core/QueueFamilyIndices.h"
+
+#include "../gfx/UploadContext.h"
+#include "../gfx/GpuBuffer.h"
+#include "../gfx/GpuImage.h"
+#include "../gfx/Pipeline.h"
+#include "../gfx/MemoryTracker.h"
+
+class VulkanContext;
+
+// --- WorkerThread ---
+// one VkCommandPool per worker-pools are not thread-safe.
+// per-frame protocol: main dispatches task => worker records secondary CB => main waits => vkCmdExecuteCommands
+
+struct WorkerThread {
+    VkCommandPool                commandPool = VK_NULL_HANDLE;
+    std::vector<VkCommandBuffer> secondaryCBs;
+
+    std::thread             thread;
+    std::mutex              mutex;
+    std::condition_variable cv;
+
+    std::function<void()>   task;
+    std::exception_ptr      error;          // non-null if task threw; checked by WaitWorker
+    bool                    ready = false;
+    bool                    done = false;
+    bool                    running = true; // set to false to stop the worker loop
+
+    // non-copyable, non-movable (mutex + condvar)
+    WorkerThread() = default;
+    WorkerThread(const WorkerThread&) = delete;
+    WorkerThread& operator=(const WorkerThread&) = delete;
+};
+
+// --- Renderer ---
+
+class Renderer {
+public:
+    Renderer(VulkanContext& context, int maxFramesInFlight = 2);
+    ~Renderer();
+
+    Renderer(const Renderer&) = delete;
+    Renderer& operator=(const Renderer&) = delete;
+
+    void Initialize(int width, int height);
+    void RecreateSwapChain(int width, int height);
+    void DrawFrame();
+    void WaitIdle();
+
+    void SetFramebufferResized(bool r) { _framebufferResized = r; }
+    bool FramebufferWasResized() const { return _framebufferResized; }
+
+    void SetViewMatrix(const glm::mat4& v) { _viewMatrix = v; }
+    void SetProjectionMatrix(const glm::mat4& p) { _projMatrix = p; }
+
+    float GetAspectRatio() const {
+        if (_swapChainExtent.height == 0) return 1.0f;
+        return (float)_swapChainExtent.width / (float)_swapChainExtent.height;
+    }
+
+    double GetAvgFrameTimeMs()   const {
+        return _frameCount > 0 ? _totalFrameTimeMs / _frameCount : 0.0;
+    }
+    double GetAvgFPS() const {
+        double elapsed = std::chrono::duration<double>(
+            std::chrono::high_resolution_clock::now() - _appStart).count();
+        return _frameCount > 0 ? _frameCount / elapsed : 0.0;
+    }
+    uint64_t GetFrameCount() const { return _frameCount; }
+    void PrintMetrics() const;
+
+private:
+    VulkanContext& _context;
+    int            _maxFramesInFlight;
+
+    glm::mat4 _viewMatrix = glm::mat4(1.0f);
+    glm::mat4 _projMatrix = glm::mat4(1.0f);
+
+    VkSwapchainKHR             _swapChain = VK_NULL_HANDLE;
+    std::vector<VkImage>       _swapChainImages;
+    VkFormat                   _swapChainImageFormat = VK_FORMAT_UNDEFINED;
+    VkExtent2D                 _swapChainExtent = {};
+    std::vector<VkImageView>   _swapChainImageViews;
+    std::vector<VkFramebuffer> _swapChainFrameBuffers;
+
+    VkRenderPass _renderPass = VK_NULL_HANDLE;
+
+    GpuImage _depthImage;
+    GpuImage _textureImage;
+    VkSampler _textureSampler = VK_NULL_HANDLE;
+
+    Pipeline _pipeline;
+
+    VkDescriptorPool             _descriptorPool = VK_NULL_HANDLE;
+    std::vector<VkDescriptorSet> _descriptorSets;
+
+    std::vector<GpuBuffer> _uniformBuffers;
+
+    VkCommandPool                _commandPool = VK_NULL_HANDLE;
+    std::vector<VkCommandBuffer> _commandBuffers; // one per frame in flight, indexed by frameIndex
+
+    GpuBuffer _vertexBuffer;
+    GpuBuffer _indexBuffer;
+    uint32_t  _indexCount = 0; // stored for the multithreaded split
+
+    // semaphores indexed by frameIndex, not imageIndex — see DrawFrame
+    std::vector<VkSemaphore> _imageAvailableSemaphores;
+    std::vector<VkSemaphore> _renderFinishedSemaphores;
+    std::vector<VkFence>     _inFlightFences;
+    uint64_t                 _currentFrame = 0;
+    bool                     _framebufferResized = false;
+
+    static constexpr int NUM_WORKERS = 2;
+    std::array<WorkerThread, NUM_WORKERS> _workers;
+    bool _workersInitialized = false;
+
+    std::chrono::high_resolution_clock::time_point _appStart;
+    uint64_t _frameCount = 0;
+    double   _totalFrameTimeMs = 0.0; // CB recording time only
+
+    void CreateSwapChain(int width, int height);
+    void CreateImageViews();
+    void CreateRenderPass();
+    void CreateDepthResources();
+    void CreateFramebuffers();
+    void CreateCommandPool();
+    void CreateTextureResources();
+    void CreateVertexBuffer();
+    void CreateIndexBuffer();
+    void CreateUniformBuffers();
+    void CreateDescriptorPool();
+    void CreateDescriptorSets();
+    void CreateCommandBuffers(); 
+    void CreateSyncObjects();
+
+    void InitWorkers();
+    void ShutdownWorkers();
+    void DispatchWorker(int workerIdx, std::function<void()> task);
+    void WaitWorker(int workerIdx);
+
+    // re-recorded every frame; imageIndex indexes framebuffers, frameIndex indexes per-frame resources
+    void RecordPrimaryCommandBuffer(uint32_t imageIndex, uint32_t frameIndex);
+
+    // recorded by a worker thread; draws [firstIndex, firstIndex+indexCount)
+    void RecordSecondaryCommandBuffer(int workerIdx,
+        uint32_t imageIndex,
+        uint32_t frameIndex,
+        uint32_t firstIndex,
+        uint32_t indexCount);
+
+    void UpdateUniformBuffer(uint32_t frameIndex);
+    void CleanupSwapChain();
+
+    VkSurfaceFormatKHR ChooseSwapSurfaceFormat(const std::vector<VkSurfaceFormatKHR>&) const;
+    VkPresentModeKHR   ChooseSwapPresentMode(const std::vector<VkPresentModeKHR>&) const;
+    VkExtent2D         ChooseSwapExtent(const VkSurfaceCapabilitiesKHR&, int w, int h) const;
+
+    VkFormat FindDepthFormat() const;
+    VkFormat FindSupportedFormat(const std::vector<VkFormat>&,
+        VkImageTiling, VkFormatFeatureFlags) const;
+};
