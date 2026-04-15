@@ -4,6 +4,7 @@
 #include "../vulkan/VulkanContext.h"
 #include "../renderer/Renderer.h"
 #include "../scene/Camera.h"
+#include "../benchmark/BenchmarkRunner.h"
 
 class TriangleApp {
 public:
@@ -11,6 +12,10 @@ public:
     ~TriangleApp() = default;
 
     void Run();
+
+    // runs ST then MT, prints comparison table and memory report.
+    // cube rotation is frozen (static model matrix), input callbacks suppressed.
+    void BenchmarkRun();
 
 private:
     // destruction order is inverse of declaration order — do not reorder

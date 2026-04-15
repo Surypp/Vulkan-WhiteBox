@@ -1,13 +1,19 @@
 #include "app/TriangleApp.h"
-#include <iostream>
+#include <cstdio>
+#include <string_view>
+#include <exception>
 
-int main() {
+int main(int argc, char** argv) {
+    bool benchmark = (argc > 1 && std::string_view(argv[1]) == "--benchmark");
     try {
         TriangleApp app;
-        app.Run();
+        if (benchmark)
+            app.BenchmarkRun();
+        else
+            app.Run();
     }
     catch (const std::exception& e) {
-        std::cerr << "Error: " << e.what() << std::endl;
+        std::fprintf(stderr, "fatal: %s\n", e.what());
         return 1;
     }
     return 0;

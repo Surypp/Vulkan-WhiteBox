@@ -1,6 +1,10 @@
 #include "TriangleApp.h"
 #include <iostream>
 
+#define GLM_FORCE_RADIANS
+#define GLM_FORCE_DEPTH_ZERO_TO_ONE
+#include <glm/gtc/matrix_transform.hpp>
+
 // --- constants ---
 
 const int WIDTH = 800;
@@ -171,4 +175,40 @@ void TriangleApp::OnKey(int key, int action) {
 
 void TriangleApp::OnFramebufferResize(int /*width*/, int /*height*/) {
     _renderer.SetFramebufferResized(true);
+}
+
+// --- BenchmarkRun ---
+// the model matrix is frozen at identity: rotation would add per-frame UBO writes
+// that vary with wall-clock time, introducing noise unrelated to CB recording cost.
+// glfwPollEvents is passed to BenchmarkRunner so the OS doesn't kill the window.
+
+void TriangleApp::BenchmarkRun() {
+    _context.CreateInstance();
+    VkSurfaceKHR surface = _window.CreateSurface(_context.GetInstance());
+    _context.Initialize(surface);
+
+    int width, height;
+    _window.GetFramebufferSize(&width, &height);
+    _renderer.Initialize(width, height);
+
+    // fixed view: no camera movement during benchmark
+    glm::mat4 view = glm::lookAt(
+        glm::vec3(0.0f, 0.5f, 3.0f),
+        glm::vec3(0.0f, 0.0f, 0.0f),
+        glm::vec3(0.0f, 1.0f, 0.0f));
+    float aspect = _renderer.GetAspectRatio();
+    _renderer.SetViewMatrix(view);
+    _renderer.SetProjectionMatrix(_camera.GetProjectionMatrix(aspect));
+    _renderer.SetModelAngle(0.0f);
+
+    auto pollFn = [this]() { _window.PollEvents(); };
+    BenchmarkRunner runner(_renderer, pollFn);
+
+    BenchmarkResult st = runner.Run(false);
+    BenchmarkResult mt = runner.Run(true);
+
+    _renderer.WaitIdle();
+
+    BenchmarkRunner::PrintComparison(st, mt);
+    MemoryTracker::Get().PrintReport();
 }
