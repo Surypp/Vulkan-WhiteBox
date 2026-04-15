@@ -71,6 +71,18 @@ public:
     void SetFramebufferResized(bool r) { _framebufferResized = r; }
     bool FramebufferWasResized() const { return _framebufferResized; }
 
+    // toggle between MT (2 workers, secondary CBs) and ST (inline, primary CB only).
+    // must be called outside of a frame — not safe to toggle mid-flight.
+    void   SetMultiThreaded(bool mt)      { _multiThreaded = mt; }
+    double GetLastRecordingTimeMs() const { return _lastRecordingTimeMs; }
+
+    // GPU execution time of the last submitted frame, measured via VkQueryPool timestamps.
+    // 0.0 on the first frame (results not yet available when the fence first signals).
+    double GetLastGpuTimeMs() const { return _lastGpuTimeMs; }
+
+    // -1.0 = time-based rotation (interactive mode). >= 0 = fixed angle in radians (benchmark mode).
+    void   SetModelAngle(float rad)       { _modelAngle = rad; }
+
     void SetViewMatrix(const glm::mat4& v) { _viewMatrix = v; }
     void SetProjectionMatrix(const glm::mat4& p) { _projMatrix = p; }
 
@@ -135,6 +147,14 @@ private:
     std::array<WorkerThread, NUM_WORKERS> _workers;
     bool _workersInitialized = false;
 
+    bool   _multiThreaded       = true;
+    double _lastRecordingTimeMs = 0.0;
+    double _lastGpuTimeMs       = 0.0;
+    float  _modelAngle          = -1.0f;
+
+    VkQueryPool _queryPool       = VK_NULL_HANDLE;
+    double      _timestampPeriod = 1.0; // nanoseconds per tick, from VkPhysicalDeviceLimits
+
     std::chrono::high_resolution_clock::time_point _appStart;
     uint64_t _frameCount = 0;
     double   _totalFrameTimeMs = 0.0; // CB recording time only
@@ -153,6 +173,7 @@ private:
     void CreateDescriptorSets();
     void CreateCommandBuffers(); 
     void CreateSyncObjects();
+    void CreateQueryPool();
 
     void InitWorkers();
     void ShutdownWorkers();
@@ -161,6 +182,10 @@ private:
 
     // re-recorded every frame; imageIndex indexes framebuffers, frameIndex indexes per-frame resources
     void RecordPrimaryCommandBuffer(uint32_t imageIndex, uint32_t frameIndex);
+
+    // ST path: VK_SUBPASS_CONTENTS_INLINE, no secondary CBs, no worker dispatch.
+    // mutually exclusive with RecordPrimaryCommandBuffer per Vulkan spec 7.1.
+    void RecordPrimaryCommandBufferST(uint32_t imageIndex, uint32_t frameIndex);
 
     // recorded by a worker thread; draws [firstIndex, firstIndex+indexCount)
     void RecordSecondaryCommandBuffer(int workerIdx,

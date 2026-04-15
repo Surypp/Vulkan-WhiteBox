@@ -81,10 +81,15 @@ Renderer::~Renderer() {
     for (int i = 0; i < _maxFramesInFlight; i++) {
         if (i < (int)_imageAvailableSemaphores.size())
             vkDestroySemaphore(_context.GetDevice(), _imageAvailableSemaphores[i], nullptr);
-        if (i < (int)_renderFinishedSemaphores.size())
-            vkDestroySemaphore(_context.GetDevice(), _renderFinishedSemaphores[i], nullptr);
         if (i < (int)_inFlightFences.size())
             vkDestroyFence(_context.GetDevice(), _inFlightFences[i], nullptr);
+    }
+    for (auto sem : _renderFinishedSemaphores)
+        vkDestroySemaphore(_context.GetDevice(), sem, nullptr);
+
+    if (_queryPool != VK_NULL_HANDLE) {
+        vkDestroyQueryPool(_context.GetDevice(), _queryPool, nullptr);
+        _queryPool = VK_NULL_HANDLE;
     }
 
     if (_commandPool != VK_NULL_HANDLE) {
@@ -114,6 +119,7 @@ void Renderer::Initialize(int width, int height) {
     CreateDescriptorSets();
     CreateCommandBuffers();
     CreateSyncObjects();
+    CreateQueryPool();
 
     InitWorkers();
 }
@@ -166,6 +172,36 @@ void Renderer::CleanupSwapChain() {
 }
 
 void Renderer::WaitIdle() { vkDeviceWaitIdle(_context.GetDevice()); }
+
+// --- CreateQueryPool ---
+// two timestamp slots per frame-in-flight: [frameIndex*2]=begin, [frameIndex*2+1]=end.
+// timestamps bracket the full render pass on the primary CB (both ST and MT paths).
+// vkCmdResetQueryPool is required before each use — Vulkan 1.0 has no host-side reset.
+
+void Renderer::CreateQueryPool() {
+    VkPhysicalDeviceProperties props{};
+    vkGetPhysicalDeviceProperties(_context.GetPhysicalDevice(), &props);
+
+    // timestampValidBits == 0 means the queue family does not support timestamps.
+    // this is extremely rare on discrete GPUs but required by spec to check.
+    QueueFamilyIndices qfi = _context.FindQueueFamilies(_context.GetPhysicalDevice());
+    uint32_t queueFamilyIndex = qfi.graphicsFamily.value();
+    uint32_t queueFamilyCount = 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(_context.GetPhysicalDevice(), &queueFamilyCount, nullptr);
+    std::vector<VkQueueFamilyProperties> queueProps(queueFamilyCount);
+    vkGetPhysicalDeviceQueueFamilyProperties(_context.GetPhysicalDevice(), &queueFamilyCount, queueProps.data());
+    if (queueProps[queueFamilyIndex].timestampValidBits == 0)
+        throw std::runtime_error("Renderer: graphics queue does not support timestamp queries");
+
+    _timestampPeriod = static_cast<double>(props.limits.timestampPeriod);
+
+    VkQueryPoolCreateInfo ci{};
+    ci.sType      = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+    ci.queryType  = VK_QUERY_TYPE_TIMESTAMP;
+    ci.queryCount = static_cast<uint32_t>(2 * _maxFramesInFlight);
+    if (vkCreateQueryPool(_context.GetDevice(), &ci, nullptr, &_queryPool) != VK_SUCCESS)
+        throw std::runtime_error("Renderer: failed to create timestamp query pool");
+}
 
 // --- workers ---
 
@@ -316,11 +352,17 @@ void Renderer::RecordPrimaryCommandBuffer(uint32_t imageIndex, uint32_t frameInd
     VkCommandBuffer cmd = _commandBuffers[frameIndex];
 
     // implicit reset via vkBeginCommandBuffer is safe here. DrawFrame already waited
-    // on inFlightFences[frameIndex], guaranteeing this CB is no longerr in use.
+    // on inFlightFences[frameIndex], guaranteeing this CB is no longer in use.
     VkCommandBufferBeginInfo bi{};
     bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     if (vkBeginCommandBuffer(cmd, &bi) != VK_SUCCESS)
         throw std::runtime_error("Renderer: failed to begin primary command buffer");
+
+    const uint32_t queryBase = frameIndex * 2;
+
+    // reset must happen outside a render pass and before the write; Vulkan 1.0 has no host reset
+    vkCmdResetQueryPool(cmd, _queryPool, queryBase, 2);
+    vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, _queryPool, queryBase);
 
     std::array<VkClearValue, 2> clears{};
     clears[0].color = { { 0.05f, 0.05f, 0.05f, 1.0f } };
@@ -359,22 +401,97 @@ void Renderer::RecordPrimaryCommandBuffer(uint32_t imageIndex, uint32_t frameInd
 
     vkCmdEndRenderPass(cmd);
 
+    vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, _queryPool, queryBase + 1);
+
     if (vkEndCommandBuffer(cmd) != VK_SUCCESS)
         throw std::runtime_error("Renderer: failed to end primary command buffer");
+}
+
+// --- RecordPrimaryCommandBufferST ---
+// ST counterpart to RecordPrimaryCommandBuffer. uses VK_SUBPASS_CONTENTS_INLINE:
+// draw commands are embedded directly in the primary CB, no secondary CB dispatch.
+// the spec forbids mixing INLINE and SECONDARY_COMMAND_BUFFERS in the same render pass.
+
+void Renderer::RecordPrimaryCommandBufferST(uint32_t imageIndex, uint32_t frameIndex) {
+    VkCommandBuffer cmd = _commandBuffers[frameIndex];
+
+    VkCommandBufferBeginInfo bi{};
+    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    if (vkBeginCommandBuffer(cmd, &bi) != VK_SUCCESS)
+        throw std::runtime_error("Renderer: failed to begin primary command buffer (ST)");
+
+    const uint32_t queryBase = frameIndex * 2;
+
+    // reset must happen outside a render pass and before the write; Vulkan 1.0 has no host reset
+    vkCmdResetQueryPool(cmd, _queryPool, queryBase, 2);
+    // TOP_OF_PIPE: timestamp written when the GPU starts processing this CB
+    vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, _queryPool, queryBase);
+
+    std::array<VkClearValue, 2> clears{};
+    clears[0].color        = { { 0.05f, 0.05f, 0.05f, 1.0f } };
+    clears[1].depthStencil = { 1.0f, 0 };
+
+    VkRenderPassBeginInfo rpi{};
+    rpi.sType           = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+    rpi.renderPass      = _renderPass;
+    rpi.framebuffer     = _swapChainFrameBuffers[imageIndex];
+    rpi.renderArea      = { { 0, 0 }, _swapChainExtent };
+    rpi.clearValueCount = (uint32_t)clears.size();
+    rpi.pClearValues    = clears.data();
+
+    vkCmdBeginRenderPass(cmd, &rpi, VK_SUBPASS_CONTENTS_INLINE);
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, _pipeline.Handle());
+
+    VkBuffer     vbs[]  = { _vertexBuffer.Handle() };
+    VkDeviceSize offs[] = { 0 };
+    vkCmdBindVertexBuffers(cmd, 0, 1, vbs, offs);
+    vkCmdBindIndexBuffer(cmd, _indexBuffer.Handle(), 0, VK_INDEX_TYPE_UINT32);
+
+    vkCmdBindDescriptorSets(cmd,
+        VK_PIPELINE_BIND_POINT_GRAPHICS,
+        _pipeline.Layout(),
+        0, 1, &_descriptorSets[frameIndex],
+        0, nullptr);
+
+    vkCmdDrawIndexed(cmd, _indexCount, 1, 0, 0, 0);
+
+    vkCmdEndRenderPass(cmd);
+
+    // BOTTOM_OF_PIPE: timestamp written after all pipeline stages complete for this CB
+    vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, _queryPool, queryBase + 1);
+
+    if (vkEndCommandBuffer(cmd) != VK_SUCCESS)
+        throw std::runtime_error("Renderer: failed to end primary command buffer (ST)");
 }
 
 // --- DrawFrame ---
 
 void Renderer::DrawFrame() {
-    // VUID-00045: index CBs by frameIndex, not imageIndex.
-    //   vkWaitForFences(inFlightFences[frameIndex]) guarantees CB[frameIndex] is no longer in use.
-    // VUID-00067: with N swapchain images and M < N frames in flight, the same image can be
-    //   returned before its acquire semaphore is consumed. Fix: one semaphore per frame in flight,
-    //   guarded by vkWaitForFences — guaranteed free before reuse.
+    // VUID-00045: CBs indexed by frameIndex. vkWaitForFences(inFlightFences[frameIndex])
+    //   guarantees CB[frameIndex] is no longer in use before re-recording.
+    // VUID-00067: imageAvailable indexed by frameIndex (fence-protected).
+    //   renderFinished indexed by imageIndex — vkAcquireNextImageKHR returning X means
+    //   image X is no longer presenting, so renderFinishedSemaphores[X] is unsignaled.
     uint32_t frameIndex = (uint32_t)(_currentFrame % _maxFramesInFlight);
 
     vkWaitForFences(_context.GetDevice(), 1,
         &_inFlightFences[frameIndex], VK_TRUE, UINT64_MAX);
+
+    // fence above guarantees CB[frameIndex] completed — timestamps are available.
+    // guard: slot frameIndex was first written on frame _currentFrame - _maxFramesInFlight.
+    // reading before that (i.e. the first cycle through all frame slots) hits an
+    // uninitialized query and triggers VUID-09401.
+    if (_currentFrame >= (uint64_t)_maxFramesInFlight) {
+        uint64_t ts[2] = {};
+        VkResult qr = vkGetQueryPoolResults(
+            _context.GetDevice(), _queryPool,
+            frameIndex * 2, 2,
+            sizeof(ts), ts, sizeof(uint64_t),
+            VK_QUERY_RESULT_64_BIT);
+        if (qr == VK_SUCCESS)
+            _lastGpuTimeMs = static_cast<double>(ts[1] - ts[0]) * _timestampPeriod * 1e-6;
+    }
 
     // semaphore is safe to reuse — fence above guarantees this frame slot is idle
     VkSemaphore acquireSem = _imageAvailableSemaphores[frameIndex];
@@ -393,13 +510,19 @@ void Renderer::DrawFrame() {
     vkResetFences(_context.GetDevice(), 1, &_inFlightFences[frameIndex]);
 
     auto recordStart = std::chrono::high_resolution_clock::now();
-    RecordPrimaryCommandBuffer(imageIndex, frameIndex);
-    auto recordEnd = std::chrono::high_resolution_clock::now();
-    _totalFrameTimeMs += std::chrono::duration<double, std::milli>(recordEnd - recordStart).count();
+    if (_multiThreaded)
+        RecordPrimaryCommandBuffer(imageIndex, frameIndex);
+    else
+        RecordPrimaryCommandBufferST(imageIndex, frameIndex);
+    auto recordEnd      = std::chrono::high_resolution_clock::now();
+    _lastRecordingTimeMs = std::chrono::duration<double, std::milli>(recordEnd - recordStart).count();
+    _totalFrameTimeMs += _lastRecordingTimeMs;
     _frameCount++;
 
     VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-    VkSemaphore signalSem = _renderFinishedSemaphores[frameIndex];
+    // imageIndex is safe here: vkAcquireNextImageKHR guarantees image X is no longer presenting,
+    // so its renderFinished semaphore has been consumed and is unsignaled.
+    VkSemaphore signalSem = _renderFinishedSemaphores[imageIndex];
 
     VkSubmitInfo si{};
     si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
@@ -451,10 +574,10 @@ void Renderer::UpdateUniformBuffer(uint32_t frameIndex) {
     float time = std::chrono::duration<float>(
         std::chrono::high_resolution_clock::now() - startTime).count();
 
+    float angle = (_modelAngle >= 0.0f) ? _modelAngle : time * glm::radians(45.0f);
+
     UniformBufferObject ubo{};
-    ubo.model = glm::rotate(glm::mat4(1.0f),
-        time * glm::radians(45.0f),
-        glm::vec3(0.0f, 1.0f, 0.0f));
+    ubo.model = glm::rotate(glm::mat4(1.0f), angle, glm::vec3(0.0f, 1.0f, 0.0f));
     ubo.view = _viewMatrix;
     ubo.proj = _projMatrix;
 
@@ -677,12 +800,17 @@ void Renderer::CreateTextureResources() {
         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
         VK_IMAGE_ASPECT_COLOR_BIT);
 
+    // batch all three image operations into one GPU submission:
+    // 3 separate UploadContext calls = 3 fence waits + 3 queue submits.
+    // a single submit collapses this to one PCIe round-trip at init time.
     UploadContext ctx(_context.GetDevice(), _commandPool, _context.GetGraphicsQueue());
-    _textureImage.TransitionLayout(ctx, VK_IMAGE_LAYOUT_UNDEFINED,
+    VkCommandBuffer cmd = ctx.Begin();
+    _textureImage.TransitionLayout(cmd, VK_IMAGE_LAYOUT_UNDEFINED,
         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-    _textureImage.CopyFromBuffer(ctx, staging.Handle(), W, H);
-    _textureImage.TransitionLayout(ctx, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+    _textureImage.CopyFromBuffer(cmd, staging.Handle(), W, H);
+    _textureImage.TransitionLayout(cmd, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    ctx.End();
 
     VkSamplerCreateInfo si{};
     si.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
@@ -771,9 +899,16 @@ void Renderer::CreateDescriptorSets() {
 }
 
 void Renderer::CreateSyncObjects() {
-    // one acquire semaphore per frame in flight (protected by vkWaitForFences in DrawFrame)
+    // imageAvailable: one per frame in flight. the fence vkWaitForFences(inFlightFences[frameIndex])
+    // guarantees the acquire semaphore for that slot is no longer in-flight before reuse.
     _imageAvailableSemaphores.resize(_maxFramesInFlight);
-    _renderFinishedSemaphores.resize(_maxFramesInFlight);
+
+    // renderFinished: one per swapchain image, indexed by imageIndex.
+    // when vkAcquireNextImageKHR returns imageIndex X, the presentation engine has finished
+    // consuming image X — so renderFinishedSemaphores[X] is guaranteed unsignaled and safe to reuse.
+    // indexing by frameIndex instead breaks this guarantee at unlimited frame rates (VUID-00067).
+    _renderFinishedSemaphores.resize(_swapChainImages.size());
+
     _inFlightFences.resize(_maxFramesInFlight);
 
     VkSemaphoreCreateInfo si{}; si.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
@@ -782,9 +917,12 @@ void Renderer::CreateSyncObjects() {
 
     for (int i = 0; i < _maxFramesInFlight; i++) {
         if (vkCreateSemaphore(_context.GetDevice(), &si, nullptr, &_imageAvailableSemaphores[i]) != VK_SUCCESS ||
-            vkCreateSemaphore(_context.GetDevice(), &si, nullptr, &_renderFinishedSemaphores[i]) != VK_SUCCESS ||
             vkCreateFence(_context.GetDevice(), &fi, nullptr, &_inFlightFences[i]) != VK_SUCCESS)
             throw std::runtime_error("Failed to create sync objects");
+    }
+    for (size_t i = 0; i < _swapChainImages.size(); i++) {
+        if (vkCreateSemaphore(_context.GetDevice(), &si, nullptr, &_renderFinishedSemaphores[i]) != VK_SUCCESS)
+            throw std::runtime_error("Failed to create render-finished semaphore");
     }
 }
 
