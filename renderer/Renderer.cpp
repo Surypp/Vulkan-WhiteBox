@@ -226,17 +226,12 @@ void Renderer::InitWorkers() {
         if (vkAllocateCommandBuffers(_context.GetDevice(), &ai, _workers[i].secondaryCBs.data()) != VK_SUCCESS)
             throw std::runtime_error("Renderer: failed to allocate worker secondary CBs");
 
-        _workers[i].running = true;
-        _workers[i].ready = false;
-        _workers[i].done = false;
-
         _workers[i].thread = std::thread([this, i]() {
             WorkerThread& w = _workers[i];
             while (true) {
-                std::unique_lock<std::mutex> lock(w.mutex);
-                w.cv.wait(lock, [&w] { return w.ready || !w.running; });
+                w.state.wait(0, std::memory_order_acquire);  // block until state != 0
 
-                if (!w.running) break;
+                if (w.state.load(std::memory_order_acquire) == 3) break;  // shutdown
 
                 try {
                     w.task();
@@ -245,10 +240,13 @@ void Renderer::InitWorkers() {
                     w.error = std::current_exception();
                 }
 
-                w.ready = false;
-                w.done = true;
-                lock.unlock();
-                w.cv.notify_one();
+                w.state.store(2, std::memory_order_release);
+                w.state.notify_one();
+
+                // wait until main acks via WaitWorker — prevents ABA re-execution
+                // if wait(0) were called here instead, a rapid re-dispatch (state→1)
+                // before this line would be indistinguishable from "task already done"
+                w.state.wait(2, std::memory_order_acquire);
             }
             });
     }
@@ -260,11 +258,8 @@ void Renderer::ShutdownWorkers() {
     if (!_workersInitialized) return;
 
     for (int i = 0; i < NUM_WORKERS; i++) {
-        {
-            std::lock_guard<std::mutex> lock(_workers[i].mutex);
-            _workers[i].running = false;
-        }
-        _workers[i].cv.notify_one();
+        _workers[i].state.store(3, std::memory_order_release);  // shutdown signal
+        _workers[i].state.notify_one();
         if (_workers[i].thread.joinable())
             _workers[i].thread.join();
 
@@ -281,19 +276,19 @@ void Renderer::ShutdownWorkers() {
 
 void Renderer::DispatchWorker(int workerIdx, std::function<void()> task) {
     WorkerThread& w = _workers[workerIdx];
-    std::lock_guard<std::mutex> lock(w.mutex);
     w.task = std::move(task);
-    w.done = false;
-    w.ready = true;
-    w.cv.notify_one();
+    w.state.store(1, std::memory_order_release);
+    w.state.notify_one();
 }
 
 void Renderer::WaitWorker(int workerIdx) {
     WorkerThread& w = _workers[workerIdx];
-    std::unique_lock<std::mutex> lock(w.mutex);
-    w.cv.wait(lock, [&w] { return w.done; });
+    w.state.wait(1, std::memory_order_acquire);  // wait until state != 1 (= 2 when done)
     // rethrow any exception the worker caught — propagates to the main thread
     if (w.error) std::rethrow_exception(w.error);
+    // reset to idle — unblocks worker's wait(2), allowing it to loop back safely
+    w.state.store(0, std::memory_order_release);
+    w.state.notify_one();
 }
 
 // --- RecordSecondaryCommandBuffer ---
@@ -479,7 +474,7 @@ void Renderer::DrawFrame() {
         &_inFlightFences[frameIndex], VK_TRUE, UINT64_MAX);
 
     // fence above guarantees CB[frameIndex] completed — timestamps are available.
-    // guard: slot frameIndex was first written on frame _currentFrame - _maxFramesInFlight.
+    // guard: slot frameIndex was first written on frame _currentFrame _maxFramesInFlight.
     // reading before that (i.e. the first cycle through all frame slots) hits an
     // uninitialized query and triggers VUID-09401.
     if (_currentFrame >= (uint64_t)_maxFramesInFlight) {

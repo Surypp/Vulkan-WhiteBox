@@ -5,8 +5,6 @@
 #include <vector>
 #include <array>
 #include <thread>
-#include <mutex>
-#include <condition_variable>
 #include <functional>
 #include <chrono>
 #include <atomic>
@@ -37,17 +35,12 @@ struct WorkerThread {
     VkCommandPool                commandPool = VK_NULL_HANDLE;
     std::vector<VkCommandBuffer> secondaryCBs;
 
-    std::thread             thread;
-    std::mutex              mutex;
-    std::condition_variable cv;
+    std::thread           thread;
+    std::atomic<int>      state{ 0 };  // 0=idle, 1=ready, 2=done, 3=shutdown
+    std::function<void()> task;
+    std::exception_ptr    error;       // non-null if task threw; checked by WaitWorker
 
-    std::function<void()>   task;
-    std::exception_ptr      error;          // non-null if task threw; checked by WaitWorker
-    bool                    ready = false;
-    bool                    done = false;
-    bool                    running = true; // set to false to stop the worker loop
-
-    // non-copyable, non-movable (mutex + condvar)
+    // non-copyable (atomic is non-movable)
     WorkerThread() = default;
     WorkerThread(const WorkerThread&) = delete;
     WorkerThread& operator=(const WorkerThread&) = delete;
