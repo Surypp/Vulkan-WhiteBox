@@ -112,7 +112,15 @@ public:
         VkImageLayout oldLayout, VkImageLayout newLayout)
     {
         VkCommandBuffer cmd = ctx.Begin();
+        TransitionLayout(cmd, oldLayout, newLayout);
+        ctx.End();
+    }
 
+    // raw-CB variant: caller owns the submit. use this to batch multiple operations
+    // into a single GPU submission and avoid the PCIe round-trip overhead per call.
+    void TransitionLayout(VkCommandBuffer cmd,
+        VkImageLayout oldLayout, VkImageLayout newLayout)
+    {
         VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT;
         if (_format == VK_FORMAT_D32_SFLOAT ||
             _format == VK_FORMAT_D32_SFLOAT_S8_UINT ||
@@ -152,15 +160,20 @@ public:
 
         vkCmdPipelineBarrier(cmd, srcStage, dstStage,
             0, 0, nullptr, 0, nullptr, 1, &barrier);
-
-        ctx.End();
     }
 
     void CopyFromBuffer(UploadContext& ctx, VkBuffer srcBuffer,
         uint32_t width, uint32_t height)
     {
         VkCommandBuffer cmd = ctx.Begin();
+        CopyFromBuffer(cmd, srcBuffer, width, height);
+        ctx.End();
+    }
 
+    // raw-CB variant: caller owns the submit.
+    void CopyFromBuffer(VkCommandBuffer cmd, VkBuffer srcBuffer,
+        uint32_t width, uint32_t height)
+    {
         VkBufferImageCopy region{};
         region.bufferOffset = 0;
         region.bufferRowLength = 0;
@@ -171,8 +184,6 @@ public:
 
         vkCmdCopyBufferToImage(cmd, srcBuffer, _image,
             VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
-
-        ctx.End();
     }
 
 private:
