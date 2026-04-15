@@ -333,6 +333,12 @@ void Renderer::RecordSecondaryCommandBuffer(int workerIdx,
         0, 1, &_descriptorSets[frameIndex], // frameIndex, not imageIndex
         0, nullptr);
 
+    // push constants are not inherited — each secondary CB must set them explicitly regardless of RENDER_PASS_CONTINUE_BIT.
+    // both workers push the same matrix; redundant by design, not an optimization opportunity.
+    // _modelMatrix is written by UpdateUniformBuffer before DispatchWorker — no data race.
+    vkCmdPushConstants(w.secondaryCBs[frameIndex], _pipeline.Layout(),
+        VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(glm::mat4), &_modelMatrix);
+
     vkCmdDrawIndexed(w.secondaryCBs[frameIndex], indexCount, 1, firstIndex, 0, 0);
 
     if (vkEndCommandBuffer(w.secondaryCBs[frameIndex]) != VK_SUCCESS)
@@ -448,6 +454,11 @@ void Renderer::RecordPrimaryCommandBufferST(uint32_t imageIndex, uint32_t frameI
         _pipeline.Layout(),
         0, 1, &_descriptorSets[frameIndex],
         0, nullptr);
+
+    // model matrix bypasses the descriptor set — written directly into the command buffer.
+    // no staging, no PCIe transfer, no descriptor lookup on the GPU side.
+    vkCmdPushConstants(cmd, _pipeline.Layout(),
+        VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(glm::mat4), &_modelMatrix);
 
     vkCmdDrawIndexed(cmd, _indexCount, 1, 0, 0, 0);
 
@@ -571,8 +582,10 @@ void Renderer::UpdateUniformBuffer(uint32_t frameIndex) {
 
     float angle = (_modelAngle >= 0.0f) ? _modelAngle : time * glm::radians(45.0f);
 
+    // model stored as a member so recording paths can push it as a push constant
+    _modelMatrix = glm::rotate(glm::mat4(1.0f), angle, glm::vec3(0.0f, 1.0f, 0.0f));
+
     UniformBufferObject ubo{};
-    ubo.model = glm::rotate(glm::mat4(1.0f), angle, glm::vec3(0.0f, 1.0f, 0.0f));
     ubo.view = _viewMatrix;
     ubo.proj = _projMatrix;
 

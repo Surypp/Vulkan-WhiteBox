@@ -124,10 +124,20 @@ public:
         colorBlending.attachmentCount = 1;
         colorBlending.pAttachments    = &colorBlendAttachment;
 
+        // push constant for the model matrix: 64 bytes (mat4), vertex stage only.
+        // 64 bytes fits within the 128-byte minimum guaranteed by the Vulkan spec;
+        // actual limit on RTX hardware is typically 256 bytes.
+        VkPushConstantRange pcRange{};
+        pcRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+        pcRange.offset     = 0;
+        pcRange.size       = sizeof(float) * 16;
+
         VkPipelineLayoutCreateInfo layoutInfo{};
-        layoutInfo.sType          = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-        layoutInfo.setLayoutCount = 1;
-        layoutInfo.pSetLayouts    = &_descriptorSetLayout;
+        layoutInfo.sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        layoutInfo.setLayoutCount         = 1;
+        layoutInfo.pSetLayouts            = &_descriptorSetLayout;
+        layoutInfo.pushConstantRangeCount = 1;
+        layoutInfo.pPushConstantRanges    = &pcRange;
 
         if (vkCreatePipelineLayout(device, &layoutInfo, nullptr, &_pipelineLayout) != VK_SUCCESS)
             throw std::runtime_error("Pipeline: failed to create pipeline layout");

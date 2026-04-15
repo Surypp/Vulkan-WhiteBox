@@ -140,10 +140,13 @@ private:
     std::array<WorkerThread, NUM_WORKERS> _workers;
     bool _workersInitialized = false;
 
-    bool   _multiThreaded       = true;
-    double _lastRecordingTimeMs = 0.0;
-    double _lastGpuTimeMs       = 0.0;
-    float  _modelAngle          = -1.0f;
+    bool      _multiThreaded       = true;
+    double    _lastRecordingTimeMs = 0.0;
+    double    _lastGpuTimeMs       = 0.0;
+    float     _modelAngle          = -1.0f;
+    // member rather than local: UpdateUniformBuffer and Record* are separate calls within DrawFrame —
+    // the matrix must survive across that boundary without passing it as a parameter through DispatchWorker lambdas.
+    glm::mat4 _modelMatrix = glm::mat4(1.0f);
 
     VkQueryPool _queryPool       = VK_NULL_HANDLE;
     double      _timestampPeriod = 1.0; // nanoseconds per tick, from VkPhysicalDeviceLimits
