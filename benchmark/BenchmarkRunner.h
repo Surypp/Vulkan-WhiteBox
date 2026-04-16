@@ -158,6 +158,14 @@ public:
         bool sig = IsSignificant(st, mt);
         std::printf("| CPU significant: %-3s  (2-sigma Welch, N=%-5u)                       |\n",
             sig ? "yes" : "no", N);
+
+        // GPU delta should be NOT significant: MT and ST submit identical GPU work.
+        // if it comes back significant, the timer is capturing presentation stalls or
+        // command processor overhead rather than pure shader execution.
+        bool gpuSig = (st.gpuMeanMs > 0.0 && mt.gpuMeanMs > 0.0)
+                   && IsSignificantGpu(st, mt);
+        std::printf("| GPU significant: %-3s  (expected: no -- identical GPU workload)        |\n",
+            gpuSig ? "yes" : "no");
         std::printf("+------------------------------------------------------------------------+\n\n");
     }
 
@@ -179,6 +187,23 @@ public:
         if (se == 0.0) return false;
 
         double delta = std::abs(a.meanMs - b.meanMs);
+        return delta > sigmaThreshold * se;
+    }
+
+    static bool IsSignificantGpu(const BenchmarkResult& a,
+                                  const BenchmarkResult& b,
+                                  double sigmaThreshold = 2.0)
+    {
+        double N_a = (double)a.gpuSamples.size();
+        double N_b = (double)b.gpuSamples.size();
+        if (N_a < 2.0 || N_b < 2.0) return false;
+
+        double var_a = a.gpuStddevMs * a.gpuStddevMs;
+        double var_b = b.gpuStddevMs * b.gpuStddevMs;
+        double se    = std::sqrt(var_a / N_a + var_b / N_b);
+        if (se == 0.0) return false;
+
+        double delta = std::abs(a.gpuMeanMs - b.gpuMeanMs);
         return delta > sigmaThreshold * se;
     }
 
