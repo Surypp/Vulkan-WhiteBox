@@ -948,6 +948,12 @@ VkSurfaceFormatKHR Renderer::ChooseSwapSurfaceFormat(
 VkPresentModeKHR Renderer::ChooseSwapPresentMode(
     const std::vector<VkPresentModeKHR>& modes) const
 {
+    // IMMEDIATE removes the vblank stall (~16.7 ms at 60 Hz) from vkQueuePresentKHR.
+    // without it, 1200 benchmark frames take ~20 s regardless of recording time.
+    // measurement window is unaffected: _lastRecordingTimeMs is sampled before vkQueueSubmit.
+    if (_benchmarkMode)
+        for (const auto& m : modes)
+            if (m == VK_PRESENT_MODE_IMMEDIATE_KHR) return m;
     for (const auto& m : modes)
         if (m == VK_PRESENT_MODE_MAILBOX_KHR) return m;
     return VK_PRESENT_MODE_FIFO_KHR;

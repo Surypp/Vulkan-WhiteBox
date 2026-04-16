@@ -67,6 +67,12 @@ public:
     // toggle between MT (2 workers, secondary CBs) and ST (inline, primary CB only).
     // must be called outside of a frame — not safe to toggle mid-flight.
     void   SetMultiThreaded(bool mt)      { _multiThreaded = mt; }
+
+    // must be set before Initialize() — affects the present mode chosen in CreateSwapChain.
+    // IMMEDIATE removes the ~16.7 ms vblank stall from vkQueuePresentKHR, cutting benchmark
+    // wall time from ~20 s (FIFO, 1200 frames) to under 1 s. measurement window is unaffected
+    // (_lastRecordingTimeMs is sampled before vkQueueSubmit, outside the present stall).
+    void   SetBenchmarkMode(bool b)       { _benchmarkMode = b; }
     double GetLastRecordingTimeMs() const { return _lastRecordingTimeMs; }
 
     // GPU execution time of the last submitted frame, measured via VkQueryPool timestamps.
@@ -140,6 +146,7 @@ private:
     std::array<WorkerThread, NUM_WORKERS> _workers;
     bool _workersInitialized = false;
 
+    bool      _benchmarkMode       = false;
     bool      _multiThreaded       = true;
     double    _lastRecordingTimeMs = 0.0;
     double    _lastGpuTimeMs       = 0.0;

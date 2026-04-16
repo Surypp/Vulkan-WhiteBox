@@ -189,6 +189,8 @@ void TriangleApp::BenchmarkRun() {
 
     int width, height;
     _window.GetFramebufferSize(&width, &height);
+    // must be set before Initialize() so CreateSwapChain picks IMMEDIATE present mode
+    _renderer.SetBenchmarkMode(true);
     _renderer.Initialize(width, height);
 
     // fixed view: no camera movement during benchmark
