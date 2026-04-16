@@ -485,7 +485,7 @@ void Renderer::DrawFrame() {
         &_inFlightFences[frameIndex], VK_TRUE, UINT64_MAX);
 
     // fence above guarantees CB[frameIndex] completed — timestamps are available.
-    // guard: slot frameIndex was first written on frame _currentFrame _maxFramesInFlight.
+    // guard: slot frameIndex was first written on frame (_currentFrame - _maxFramesInFlight).
     // reading before that (i.e. the first cycle through all frame slots) hits an
     // uninitialized query and triggers VUID-09401.
     if (_currentFrame >= (uint64_t)_maxFramesInFlight) {
@@ -564,11 +564,11 @@ void Renderer::DrawFrame() {
 
 void Renderer::PrintMetrics() const {
     std::printf("\n+----------------------------------------------+\n");
-    std::printf("|         Renderer -- M4 Frame Metrics          |\n");
+    std::printf("|         Renderer -- M5 Frame Metrics          |\n");
     std::printf("+----------------------------------------------+\n");
     std::printf("|  frames rendered          : %-10llu       |\n", (unsigned long long)_frameCount);
     std::printf("|  avg FPS                  : %-10.2f       |\n", GetAvgFPS());
-    std::printf("|  Temps CB moyen (CPU)     : %-10.4f ms   |\n", GetAvgFrameTimeMs());
+    std::printf("|  avg CB recording time    : %-10.4f ms   |\n", GetAvgFrameTimeMs());
     std::printf("+----------------------------------------------+\n\n");
     MemoryTracker::Get().PrintReport();
 }
